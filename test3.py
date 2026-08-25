@@ -6,6 +6,8 @@ import socket
 import serial
 import struct
 import base64
+import queue
+import numpy as np
 from datetime import datetime
 from websocket import create_connection, WebSocketConnectionClosedException, WebSocketTimeoutException
 import pycodec2
@@ -32,7 +34,6 @@ data_buffer = {}
 buffer_lock = threading.Lock()
 
 FRAME_FORMAT = '>BHHBBBHH3h3h3h3hBBB'
-emergency_map = {0: "정상", 1: "🚨 살려주세요", 2: "🚨 도와주세요", 3: "🚨 구해주세요"}
 
 c2_dec = pycodec2.Codec2(2400)
 c2_enc = pycodec2.Codec2(2400)
@@ -41,6 +42,12 @@ in_voice_call = False
 active_call_rail = 0
 voice_call_lock = threading.Lock()
 last_call_end_time = 0
+last_downlink_time = 0
+
+# [수정] 큐 사이즈를 5로 줄여 과거 데이터가 쌓여 딜레이를 유발하는 현상 원천 차단
+downlink_audio_queue = queue.Queue(maxsize=5)
+rx_downlink_pkt_cnt = 0
+uplink_pcm_buffer = b""
 
 def safe_ws_send(ws, message_str: str) -> bool:
     if ws is None: return False
@@ -88,7 +95,6 @@ def send_plc_16bit_bytes(msb_byte: int, lsb_byte: int, expected_bytes: int = 2, 
             return None
 
 def send_plc_call_control_burst(rail_id: int, is_start: bool):
-    """[PLC 핵심] 음성 충돌을 뚫고 100% 안착되도록 15ms 간격 8회 고속 버스트 스팸"""
     global ser
     if ser is None or not ser.is_open: return
     target_msb = rail_id & 0x0F
@@ -99,24 +105,43 @@ def send_plc_call_control_burst(rail_id: int, is_start: bool):
         try:
             ser.reset_input_buffer()
             ser.reset_output_buffer()
-            for _ in range(8):
+            for _ in range(5):
                 ser.write(cmd_bytes)
                 ser.flush()
-                time.sleep(0.015)
-            print(f"📞 [PLC 버스트 전송 성공] 난간 #{rail_id:02d} ({'통화 시작' if is_start else '통화 종료'})", flush=True)
+                time.sleep(0.01)
+            print(f"📞 [PLC 통화 제어 관통 전송] 난간 #{rail_id:02d} ({'시작' if is_start else '종료'})", flush=True)
         except Exception:
             pass
 
-def send_plc_codec2_downlink(c2_bytes: bytes):
-    global ser
-    if ser is None or not ser.is_open or len(c2_bytes) == 0: return
-    with serial_lock:
+def downlink_audio_worker():
+    global ser, in_voice_call, last_downlink_time
+    print("🚀 [PTT 다운링크 워커 시작]", flush=True)
+
+    while True:
         try:
-            frame = bytes([0x5A, 0xA5, len(c2_bytes) & 0xFF]) + c2_bytes
-            ser.write(frame)
-            ser.flush()
-        except Exception:
-            pass
+            c2_bytes = downlink_audio_queue.get(timeout=0.1)
+        except queue.Empty:
+            continue
+
+        with voice_call_lock:
+            talking = in_voice_call
+
+        if talking and ser is not None and ser.is_open and len(c2_bytes) > 0:
+            last_downlink_time = time.time() 
+            while True:
+                acquired = serial_lock.acquire(timeout=0.05)
+                if acquired:
+                    try:
+                        frame = bytes([0x5A, 0xA5, len(c2_bytes) & 0xFF]) + c2_bytes
+                        ser.write(frame)
+                        ser.flush()
+                    except Exception as e:
+                        print(f"❌ 다운링크 시리얼 에러: {e}", flush=True)
+                    finally:
+                        serial_lock.release()
+                    break 
+                else:
+                    time.sleep(0.01) 
 
 def ten_minute_save_loop(ws):
     while True:
@@ -140,7 +165,8 @@ def ten_minute_save_loop(ws):
                     data_buffer[rail_id] = {"left": [], "right": [], "battery": []}
 
 def receive_messages(ws):
-    global in_voice_call, active_call_rail, last_call_end_time
+    global in_voice_call, active_call_rail, last_call_end_time, rx_downlink_pkt_cnt
+    global uplink_pcm_buffer 
     ws.settimeout(1.0)
 
     while True:
@@ -155,7 +181,6 @@ def receive_messages(ws):
             data = json.loads(body_raw)
             cmd_type = data.get("commandType")
 
-            # 1. 관제소 비상 통화 제어 (CALL_START / CALL_END)
             if cmd_type == "VOICE_CALL_CONTROL":
                 action = data.get("action")
                 target_rail = data.get("railSeq", 1)
@@ -167,7 +192,7 @@ def receive_messages(ws):
                     send_plc_call_control_burst(target_rail, is_start=True)
                     ack = {"apiKey": API_KEY, "commandType": "CALL_ACK", "action": "CALL_START", "railSeq": target_rail}
                     safe_ws_send(ws, f"SEND\ndestination:/pub/rails/call/confirm\ncontent-type:application/json\n\n{json.dumps(ack)}\x00")
-                    print(f"📞 [관제소 호출 1클릭 시작] #{target_rail:02d}번 난간", flush=True)
+                    print(f"📞 [관제소 호출 시작] #{target_rail:02d}번 난간", flush=True)
 
                 elif action == "CALL_END":
                     last_call_end_time = time.time()
@@ -175,14 +200,18 @@ def receive_messages(ws):
                         in_voice_call = False
                         active_call_rail = 0
                     
-                    # [핵심] 수신 루프가 멈춘 상태에서 PLC 버스로 8회 버스트 송신
+                    while not downlink_audio_queue.empty():
+                        try: downlink_audio_queue.get_nowait()
+                        except: break
+                    
+                    uplink_pcm_buffer = b"" 
+
                     send_plc_call_control_burst(target_rail, is_start=False)
                     ack = {"apiKey": API_KEY, "commandType": "CALL_ACK", "action": "CALL_END", "railSeq": target_rail}
                     safe_ws_send(ws, f"SEND\ndestination:/pub/rails/call/confirm\ncontent-type:application/json\n\n{json.dumps(ack)}\x00")
-                    print(f"📞 [관제소 종료 1클릭 해제 완료] #{target_rail:02d}번 난간", flush=True)
+                    print(f"📞 [관제소 종료 완료] #{target_rail:02d}번 난간", flush=True)
                 continue
 
-            # 2. 관제소 PTT 다운링크 음성
             if cmd_type == "VOICE_DOWNLINK":
                 with voice_call_lock:
                     is_talking = in_voice_call
@@ -190,17 +219,40 @@ def receive_messages(ws):
                 if is_talking:
                     audio_b64 = data.get("audioData", "")
                     if audio_b64:
-                        raw_pcm = base64.b64decode(audio_b64)
-                        c2_frames = bytearray()
-                        for offset in range(0, len(raw_pcm) - 319, 320):
-                            chunk = raw_pcm[offset:offset+320]
-                            c2_frames.extend(c2_enc.encode(chunk))
+                        try:
+                            raw_pcm = base64.b64decode(audio_b64)
+                            uplink_pcm_buffer += raw_pcm
+                            
+                            samples = np.frombuffer(uplink_pcm_buffer, dtype=np.int16)
+                            c2_frames = bytearray()
+                            num_frames = len(samples) // 160
+                            
+                            for i in range(num_frames):
+                                chunk = samples[i * 160 : (i + 1) * 160]
+                                encoded_bytes = c2_enc.encode(chunk)
+                                c2_frames.extend(encoded_bytes)
 
-                        if len(c2_frames) > 0:
-                            send_plc_codec2_downlink(bytes(c2_frames))
+                            remainder = len(samples) % 160
+                            if remainder > 0:
+                                uplink_pcm_buffer = samples[-remainder:].tobytes()
+                            else:
+                                uplink_pcm_buffer = b""
+
+                            if len(c2_frames) > 0:
+                                for i in range(0, len(c2_frames), 48):
+                                    chunk_c2 = c2_frames[i : i + 48]
+                                    if downlink_audio_queue.full():
+                                        try: downlink_audio_queue.get_nowait()
+                                        except: pass
+                                    downlink_audio_queue.put_nowait(bytes(chunk_c2))
+
+                                rx_downlink_pkt_cnt += 1
+                                if rx_downlink_pkt_cnt % 5 == 1:
+                                    print(f"🎙️ [PTT 다운링크 수신] {rx_downlink_pkt_cnt}번째 패킷 인코딩 및 큐 분할 투입 완료", flush=True)
+                        except Exception as e:
+                            print(f"⚠️ 오디오 인코딩 예외: {e}", flush=True)
                 continue
 
-            # 3. 오디오 제어
             if cmd_type == "AUDIO_CONTROL":
                 volume = data.get("volume", 50)
                 play_mode_str = data.get("playMode", "RANDOM")
@@ -224,7 +276,6 @@ def receive_messages(ws):
                 safe_ws_send(ws, f"SEND\ndestination:/pub/rails/audio/confirm\ncontent-type:application/json\n\n{json.dumps(ack_payload)}\x00")
                 continue
 
-            # 4. 16비트 모드 제어
             full_cmd_16bit = data.get('railMode', data.get('mode', data.get('rail_mode', None)))
             if full_cmd_16bit is not None:
                 web_rail_seq = data.get('railSeq', data.get('rail_seq', data.get('seq', 0)))
@@ -254,12 +305,12 @@ def receive_messages(ws):
 
         except (socket.timeout, WebSocketTimeoutException):
             continue
-        except Exception:
+        except Exception as e:
+            print(f"웹소켓 수신 에러: {e}")
             break
 
 def handle_active_voice_call(ws, rail_id):
-    """PLC 버스 경합을 줄인 음성 수신 루프"""
-    global ser, in_voice_call, active_call_rail, last_call_end_time
+    global ser, in_voice_call, active_call_rail, last_call_end_time, last_downlink_time
     rx_stream_buf = bytearray()
 
     while True:
@@ -271,9 +322,13 @@ def handle_active_voice_call(ws, rail_id):
             time.sleep(0.01)
             continue
 
-        with serial_lock:
-            if ser.in_waiting > 0:
-                rx_stream_buf.extend(ser.read(ser.in_waiting))
+        acquired = serial_lock.acquire(timeout=0.02)
+        if acquired:
+            try:
+                if ser.in_waiting > 0:
+                    rx_stream_buf.extend(ser.read(ser.in_waiting))
+            finally:
+                serial_lock.release()
 
         if len(rx_stream_buf) > 1024:
             rx_stream_buf = rx_stream_buf[-512:]
@@ -301,7 +356,9 @@ def handle_active_voice_call(ws, rail_id):
                         if len(frame) == 6:
                             pcm_out.extend(c2_dec.decode(frame))
 
-                    if len(pcm_out) > 0:
+                    is_broadcasting = (time.time() - last_downlink_time < 0.4)
+
+                    if len(pcm_out) > 0 and not is_broadcasting:
                         audio_payload = {
                             "apiKey": API_KEY, "railSeq": rail_id,
                             "audioData": base64.b64encode(bytes(pcm_out)).decode('ascii')
@@ -336,6 +393,7 @@ def connect_and_run():
         safe_ws_send(ws, f"SUBSCRIBE\nid:sub-3\ndestination:/sub/device/{API_KEY}/audio\n\n\x00")
 
         threading.Thread(target=receive_messages, args=(ws,), daemon=True).start()
+        threading.Thread(target=downlink_audio_worker, daemon=True).start()
         threading.Thread(target=ten_minute_save_loop, args=(ws,), daemon=True).start()
 
         print(f"⚡ [정상 통신 가동] 1~{TOTAL_RAILS}번 난간 실시간 폴링 시작...\n", flush=True)
@@ -378,15 +436,6 @@ def connect_and_run():
 
                         print("----------------------------------------------------------------------", flush=True)
                         print(f"📡 [난간 #{rail_id:02d}] 배터리:{battery_pct}% | 전력: L {left_watt}W / R {right_watt}W | 통계: In {in_count} / Out {out_count}", flush=True)
-
-                        r1_active = [f"T{i+1}(X:{t['x']}, Y:{t['y']})" for i, t in enumerate(radar1_targets) if (t['x'] != 0 or t['y'] != 0)]
-                        r2_active = [f"T{i+1}(X:{t['x']}, Y:{t['y']})" for i, t in enumerate(radar2_targets) if (t['x'] != 0 or t['y'] != 0)]
-
-                        r1_str = ", ".join(r1_active) if r1_active else "감지 없음"
-                        r2_str = ", ".join(r2_active) if r2_active else "감지 없음"
-
-                        print(f"   🎯 [레이더1] 감지:{r1_det} -> {r1_str}", flush=True)
-                        print(f"   🎯 [레이더2] 감지:{r2_det} -> {r2_str}", flush=True)
 
                         now_ts = time.time()
                         if (now_ts - last_call_end_time) < 1.0:
