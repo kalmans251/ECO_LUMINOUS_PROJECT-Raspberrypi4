@@ -33,6 +33,8 @@ ws_lock = threading.Lock()
 data_buffer = {}
 buffer_lock = threading.Lock()
 
+# 39바이트 언팩 포맷
+# (B, H, H, B, B, B, H, H, 3h, 3h, 3h, 3h, B, B, B)
 FRAME_FORMAT = '>BHHBBBHH3h3h3h3hBBB'
 
 c2_dec = pycodec2.Codec2(2400)
@@ -44,7 +46,6 @@ voice_call_lock = threading.Lock()
 last_call_end_time = 0
 last_downlink_time = 0
 
-# [수정] 큐 사이즈를 5로 줄여 과거 데이터가 쌓여 딜레이를 유발하는 현상 원천 차단
 downlink_audio_queue = queue.Queue(maxsize=5)
 rx_downlink_pkt_cnt = 0
 uplink_pcm_buffer = b""
@@ -109,7 +110,7 @@ def send_plc_call_control_burst(rail_id: int, is_start: bool):
                 ser.write(cmd_bytes)
                 ser.flush()
                 time.sleep(0.01)
-            print(f"📞 [PLC 통화 제어 관통 전송] 난간 #{rail_id:02d} ({'시작' if is_start else '종료'})", flush=True)
+            print(f"📞 [PLC 통화 제어 전송] 난간 #{rail_id:02d} ({'시작' if is_start else '종료'})", flush=True)
         except Exception:
             pass
 
@@ -248,7 +249,7 @@ def receive_messages(ws):
 
                                 rx_downlink_pkt_cnt += 1
                                 if rx_downlink_pkt_cnt % 5 == 1:
-                                    print(f"🎙️ [PTT 다운링크 수신] {rx_downlink_pkt_cnt}번째 패킷 인코딩 및 큐 분할 투입 완료", flush=True)
+                                    print(f"🎙️ [PTT 다운링크 수신] {rx_downlink_pkt_cnt}번째 패킷 인코딩 완료", flush=True)
                         except Exception as e:
                             print(f"⚠️ 오디오 인코딩 예외: {e}", flush=True)
                 continue
@@ -435,7 +436,11 @@ def connect_and_run():
                         radar2_targets = [{"x": r2_x1, "y": r2_y1}, {"x": r2_x2, "y": r2_y2}, {"x": r2_x3, "y": r2_y3}]
 
                         print("----------------------------------------------------------------------", flush=True)
-                        print(f"📡 [난간 #{rail_id:02d}] 배터리:{battery_pct}% | 전력: L {left_watt}W / R {right_watt}W | 통계: In {in_count} / Out {out_count}", flush=True)
+                        print(f"📡 [난간 #{rail_id:02d}] 배터리:{battery_pct}% | 전력: L {left_watt}W / R {right_watt}W | 카운트: In {in_count} / Out {out_count}", flush=True)
+                        
+                        # 💡 [디버그] 레이더 직교좌표 및 감지 상태 상세 출력
+                        print(f"   🎯 Radar 1 [감지: {bool(r1_det)}] -> T1:({r1_x1:5d}, {r1_y1:5d}) | T2:({r1_x2:5d}, {r1_y2:5d}) | T3:({r1_x3:5d}, {r1_y3:5d}) mm", flush=True)
+                        print(f"   🎯 Radar 2 [감지: {bool(r2_det)}] -> T1:({r2_x1:5d}, {r2_y1:5d}) | T2:({r2_x2:5d}, {r2_y2:5d}) | T3:({r2_x3:5d}, {r2_y3:5d}) mm", flush=True)
 
                         now_ts = time.time()
                         if (now_ts - last_call_end_time) < 1.0:
